@@ -1,21 +1,30 @@
 #### loading libraries and data ####
 
 library(shiny)
+library(shinybusy)
 library(shiny.semantic)
+library(semantic.dashboard)
 library(geosphere)
 library(leaflet)
 library(tidyverse)
 library(lubridate)
-library(shinybusy)
+library(DT)
+library(shinyjs)
 
-# # DATA CLEANING
-# # outside of this app I've cleaned the data: it seemed like there were some
-# # incorrect SHIPNAMES (". PRINCE OF WAVES", ".WLA-311", "[SAT-AIS]").
-# # There are also some ships with numbers as SHIPNAMEs, but their SHIP_id
-# # doesn't seem to align with any other ship with legit-looking names.
-# # I've decided to keep their data in the app.
-# #
-# # DATA PREPARATION
+
+# DATA CLEANING
+# outside of this app I've cleaned the data: it seemed like there were some
+# incorrect SHIPNAMES (. PRINCE OF WAVES, .WLA-311, [SAT-AIS]).
+# There are also some ships with numbers as SHIPNAMEs, but their SHIP_id
+# doesn't seem to align with any other ship with legit-looking names.
+# I've decided to keep their data in the app.
+# # # # # # # # # # # # # # # # # # # # # # 
+# # DATA PREPARATION - firstly I intended to do it inside shinyapp. Unfortunately,
+# # it gave me "code 137, signal 9 (SIGKILL)" error in shinyapps.io, most possibly
+# # due to too much memory usage or too big database. Below are the steps
+# # I took to prepare the data - saved it as "data_joined.csv" then, and the app
+# # reads only this file
+# # # # # # # # # # # # # # # # # # # # # # 
 # # I need to first bind the start and end localization of each vessel in each trip
 # # I presumed that each trip starts with first observation when the is_parked == 0
 # # and each trip ends with first observation when the is_parked == 1
@@ -86,7 +95,12 @@ distances <- function(data, vessel, method){
     
     
     all <- data %>%
-        arrange(desc(distance, DATETIME_start))
+        arrange(desc(distance, DATETIME_start)) %>%
+        mutate(dur_temp = as_datetime(DATETIME_end) - as_datetime(DATETIME_start),
+               duration = as.character(as.period(dur_temp)),
+               duration_s = as.numeric(dur_temp, units = "secs"),
+               mean_speed = (distance/1000)/as.numeric(dur_temp, units = "hours")
+        )
         
     list("longest" = longest, 
          "all" = all)
@@ -106,6 +120,7 @@ vessel_choose <- function(id) {
     ns <- NS(id)
 
     tagList(
+    
         selectInput(NS(id,"vessel_type"),
                     "Choose a vessel type to search for:",
                     choices = c("any", unique(data_joined$ship_type)),
@@ -138,10 +153,10 @@ select_server <- function(id){
     # updated input choices
             
         observe({
+          
+          req(!is.null(input$vessel_type))
             
             vessel_type <- input$vessel_type
-            
-            req(!is.null(input$vessel_type))
             
             if(input$vessel_type == "any"){
                 
@@ -177,7 +192,12 @@ select_server <- function(id){
 
 #### UI code ####
 
-ui <- semanticPage(shiny.semantic::sidebar_layout(
+ui <- semanticPage(
+    useShinyjs(),
+    sidebar_layout(
+    
+    # sidebar definition
+    
     sidebar_panel(
         h1("Ship trips search engine"),
         div(class = "ui raised segment",
@@ -200,41 +220,16 @@ ui <- semanticPage(shiny.semantic::sidebar_layout(
             
         
     ),
-    main_panel(add_busy_bar(),
+    main_panel(
         
-        div(class = "ui horizontal divider",
-            "Mapped beginning and end of longest trip"),
+        add_busy_bar(),
         
         leafletOutput("sail_leaflet"),
         
-        div(class = "ui two column centered grid",
+        uiOutput("infoboxes")
         
-        div(class = "column",  
-        
-        div(class = "ui horizontal divider",
-            "Additional informations about longest trip"),
-        
-        flow_layout(
-            div(class = "ui raised segment",
-                htmlOutput("start")),
-            div(class = "ui raised segment",
-                htmlOutput("end")),
-            div(class = "ui raised segment",
-                htmlOutput("duration")))),
-        
-        div(class = "column",
-        
-        div(class = "ui horizontal divider",
-            "Additional informations about trips in database"),
-        flow_layout(
-            div(class = "ui raised segment",
-                htmlOutput("n_trips")),
-            div(class = "ui fluid container",
-                plotOutput("all_trips_hist")))
-            ))))
-        
-    
-    )
+
+            )))
     
 #### server code #####
 
@@ -243,6 +238,13 @@ server <- shinyServer(function(input, output, session) {
     # getting the values from modules
     
     parameters <- select_server("ships")
+    
+    observe({
+        
+        parameters()
+        shinyjs::runjs("window.scrollTo(0, 0)")
+        
+    })
     
     # creating leaflet
     
@@ -257,11 +259,15 @@ server <- shinyServer(function(input, output, session) {
                        label = "Start") %>%
             addMarkers(lng = data$LON_end,
                        lat = data$LAT_end,
-                       label = "End")
+                       label = "End") %>%
+            addPolylines(lng = c(data$LON_start,
+                                 data$LON_end),
+                         lat = c(data$LAT_start,
+                                 data$LAT_end))
         
     })
     
-    # creating additional values
+    # creating additional values - for display under the leaflet
         
     additional <- reactive({
         
@@ -289,66 +295,182 @@ server <- shinyServer(function(input, output, session) {
         
         "dist" = list("distance" = paste(
                                 as.character(round(data$longest$distance, 2)), 
-                                "meters", sep = " "),
+                                "m", sep = " "),
                      "time" = as.character(as.period(time_diff)),
                      "mean_speed" = paste(
                                 as.character(round((data$longest$distance/1000)/as.numeric(time_diff, units = "hours"), 2)),
-                                "kilometers per hour")),
+                                "km/h")),
         
         # numbers of all trips for this ship
         
-        "all_trips" = paste("This vessel made",
-            as.character(nrow(data$all)),
-            "trips recorded in database", sep = " ")
+        "all_trips" = nrow(data$all)
         
     )
     
     })
     
-    output$all_trips_hist <- renderPlot({
+    # infoboxes UI contains everything under the leaflet
+    # rendering in renderUI to optimize
+    
+output$infoboxes <- renderUI({
+    
+        # list of elements that should render always
+    
+    always_UI <- list(
+        
+    div(class = "ui horizontal divider", "Longest vessel trip info"),
+        
+        # box with details about start point: Latitude, Longitude and time of beginning
+        
+    box(title = "Start point info",
+    div(class = "ui one row stackable grid layout",
+        div(class = "three column row",
+            div(class = "column",
+                infoBox(subtitle = "Latitude",
+                        value = additional()$trip_start$lat,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Longitude",
+                        value = additional()$trip_start$lon,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Time of start",
+                        value = additional()$trip_start$time,
+                        size = "tiny")),
+        ))),
+
+        # box with detail about end point: same as above
+    
+    box(title = "End point info",
+    div(class = "ui one row stackable grid layout",
+        div(class = "three column row",
+            div(class = "column",
+                infoBox(subtitle = "Latitude",
+                        value = additional()$trip_end$lat,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Longitude",
+                        value = additional()$trip_end$lon,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Time of start",
+                        value = additional()$trip_end$time,
+                        size = "tiny")),
+        ))),
+
+        # box with info about trip: Distance, Duration and Mean speed in km/h
+    
+    box(title = "Trip info",
+    div(class = "ui one row stackable grid layout",
+        div(class = "three column row",
+            div(class = "column",
+                infoBox(subtitle = "Distance",
+                        value = additional()$dist$distance,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Duration",
+                        value = additional()$dist$time,
+                        size = "tiny")),
+            div(class = "column",
+                infoBox(subtitle = "Mean speed",
+                        value = additional()$dist$mean_speed,
+                        size = "tiny")),
+        ))),
+    div(class = "ui horizontal divider", "All trips of vessel info"),
+    infoBox(subtitle = "Number of trips in database",
+            value = additional()$all_trips),
+    
+    # datatable of all trips by this vessel
+    
+    box(style = "overflow-y: scroll;overflow-x: scroll;", title = "Datatable",
+    
+    renderDT({
+        
+        parameters()$all %>%
+            arrange(DATETIME_start) %>%
+            
+            select("Distance sailed" = distance,
+                   "Duration of trip" = duration,
+                   "Duration in seconds" = duration_s,
+                   "Mean speed" = mean_speed,
+                   "Time of start" = DATETIME_start,
+                   "Start latitude" = LAT_start,
+                   "Start longitude" = LON_start,
+                   "Time of end" = DATETIME_end,
+                   "End latitude" = LAT_end,
+                   "End longitude" = LON_end)
+
+        }),
+    
+    downloadButton("DTdownload", "Download ship trips database")
+    
+    )
+    
+    )
+    
+    # histogram of distances - different list, at it should be generated
+    # conditionally
+
+    histogram <- list(
+        
+        box(title = "Histogram",
+        
+        renderPlot({
         
         parameters()$all %>%
             ggplot(aes(distance)) + 
             geom_histogram() + 
             theme_minimal() + 
             xlab("Distance in meters") +
-            ylab("Count of trips")
-        
-    })
+            ylab("Count of trips") + 
+            ggtitle("Distances of vessel trips in database")
+
+            })
     
-    output$start <- renderText({
-        
-        paste("<h3>Time started:</h3>",
-              "<p>", additional()$trip_start$time, "</p>",
-              "<h3>Location of start:</h3>",
-              "<p>Longitude:",additional()$trip_start$lon,"<br>",
-              "Latitude:", additional()$trip_start$lat, "</p>")
-         })
+    ))
     
-    output$end <- renderText({
-        
-        paste("<h3>Time ended:</h3>",
-              "<p>", additional()$trip_end$time, "</p>",
-              "<h3>Location of end:</h3>",
-              "<p>Longitude:",additional()$trip_end$lon,"<br>",
-              "Latitude:", additional()$trip_end$lat, "</p>")
-    })
+    # conditional: histogram should render only if number of all trips
+    # by that vessel is bigger than one: histogram for one value
+    # is redundant
     
-    output$duration <- renderText({
+    if(additional()$all_trips == 1){
         
-        paste("<h3>Distance</h3><p>",
-              additional()$dist$distance,"</p>",
-              "<h3>Time of trip</h3><p>",
-              additional()$dist$time,"</p>",
-              "<h3>Mean speed</h3><p>",
-              additional()$dist$mean_speed, "</p>")
-    })
+        always_UI
+        
+    } else {
+        
+        list(always_UI,
+             histogram)
+    }
     
-    output$n_trips <- renderText({
-        
-        additional()$all_trips
-        
-    })
+})
+
+    # download handler for .csv of vessel trips
+
+output$DTdownload <- downloadHandler(
+    filename = function(){
+        paste0(parameters()$all$SHIPNAME[1],
+               "sail_data.csv")},
+    content = function(file){
+        write.csv(select(parameters()$all,
+                         SHIPNAME,
+                         sail_id,
+                         ship_type,
+                         LAT_start,
+                         LON_start,
+                         DATETIME_start,
+                         LAT_end,
+                         LON_end,
+                         DATETIME_end,
+                         distance,
+                         duration_s,
+                         mean_speed), file)
+    }
+    
+    
+    
+)
+
     
 })
 
